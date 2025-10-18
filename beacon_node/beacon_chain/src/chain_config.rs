@@ -174,7 +174,8 @@ impl Default for ChainConfig {
             optimistic_finalized_sync: true,
             stateless_validation: false,
             generate_execution_proofs: false,
-            max_execution_proof_subnets: 8,
+            // MAX_EXECUTION_PROOF_SUBNETS is currently set to 1 for testing.
+            max_execution_proof_subnets: 1,
             stateless_min_proofs_required: 1,
             shuffling_cache_size: crate::shuffling_cache::DEFAULT_CACHE_SIZE,
             genesis_backfill: false,
