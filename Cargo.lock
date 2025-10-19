@@ -893,6 +893,7 @@ dependencies = [
  "proto_array",
  "rand 0.9.0",
  "rayon",
+ "reqwest 0.11.27",
  "safe_arith",
  "sensitive_url",
  "serde",
@@ -913,6 +914,7 @@ dependencies = [
  "tree_hash",
  "tree_hash_derive",
  "types",
+ "zip",
  "zstd 0.13.3",
 ]
 

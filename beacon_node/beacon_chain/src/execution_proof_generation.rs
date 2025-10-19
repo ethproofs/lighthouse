@@ -3,16 +3,155 @@
 //! This module handles the generation and verification of execution proofs.
 //! Currently implements dummy proof generation, but will be replaced with
 //! actual proof generation from zkVMs or other proof systems.
-
+use reqwest::StatusCode;
+use std::io::{Cursor, Read};
 use tracing::debug;
 use types::{
     EthSpec, ExecutionPayload, ExecutionProof, Hash256,
     execution_proof_subnet_id::ExecutionProofSubnetId,
 };
+use zip::ZipArchive;
+
+/// Represents a single proof file extracted from the ZIP archive
+#[derive(Debug, Clone)]
+pub struct ProofFile {
+    /// The name of the file in the ZIP archive
+    pub filename: String,
+    /// The binary content of the proof file
+    pub data: Vec<u8>,
+}
+
+/// Collection of proof files extracted from a ZIP archive
+#[derive(Debug)]
+pub struct ProofArchive {
+    /// All proof files extracted from the archive
+    pub files: Vec<ProofFile>,
+}
+
+impl ProofArchive {
+    /// Find a proof file by its filename
+    pub fn find_file(&self, filename: &str) -> Option<&ProofFile> {
+        self.files.iter().find(|f| f.filename == filename)
+    }
+
+    /// Get all filenames in the archive
+    pub fn filenames(&self) -> Vec<&str> {
+        self.files.iter().map(|f| f.filename.as_str()).collect()
+    }
+}
+
+/// Extract all files from a ZIP archive
+fn extract_zip_archive(zip_bytes: &[u8]) -> Result<ProofArchive, String> {
+    // Create a cursor over the bytes to allow reading
+    let cursor = Cursor::new(zip_bytes);
+
+    // Open the ZIP archive
+    let mut archive =
+        ZipArchive::new(cursor).map_err(|e| format!("Failed to open ZIP archive: {}", e))?;
+
+    let mut files = Vec::new();
+
+    // Iterate through all files in the archive
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("Failed to access file at index {}: {}", i, e))?;
+
+        // Skip directories
+        if file.is_dir() {
+            continue;
+        }
+
+        let filename = file.name().to_string();
+
+        // Read the file contents into a buffer
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .map_err(|e| format!("Failed to read file '{}': {}", filename, e))?;
+
+        debug!(
+            filename = %filename,
+            size_bytes = data.len(),
+            "Extracted proof file from ZIP archive"
+        );
+
+        files.push(ProofFile { filename, data });
+    }
+
+    if files.is_empty() {
+        return Err("ZIP archive contains no files".to_string());
+    }
+
+    debug!(
+        file_count = files.len(),
+        "Successfully extracted all files from ZIP archive"
+    );
+
+    Ok(ProofArchive { files })
+}
+
+/// Download and extract proofs from Ethproofs for PoC implementation.
+///
+/// TODO(zkproofs): Remove with actual proof generation.
+///
+/// This accepts the block hash and returns the extracted proof files.
+/// The API response should be a ZIP file containing multiple binary proof files.
+///
+/// # Example Usage
+///
+/// ```ignore
+/// // Download proofs for a block
+/// let archive = download_proofs_from_ethproofs(12345).await?;
+///
+/// // List all files in the archive
+/// for filename in archive.filenames() {
+///     println!("Found proof file: {}", filename);
+/// }
+///
+/// // Access a specific proof file by name
+/// if let Some(proof_file) = archive.find_file("proof_0.bin") {
+///     println!("Proof size: {} bytes", proof_file.data.len());
+///     // Use the binary data: proof_file.data
+/// }
+///
+/// // Iterate through all files
+/// for file in &archive.files {
+///     println!("Processing {}: {} bytes", file.filename, file.data.len());
+///     // Process each binary proof file
+/// }
+/// ```
+async fn download_proofs_from_ethproofs(
+    block_hash: types::ExecutionBlockHash,
+) -> Result<ProofArchive, String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "https://ethproofs.org/api/v0/proofs/download/block/{}",
+            block_hash
+        ))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    match response.status() {
+        StatusCode::OK => {
+            // Download the ZIP file as bytes
+            let zip_bytes = response
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to read response: {}", e))?;
+
+            // Extract the ZIP contents
+            extract_zip_archive(&zip_bytes)
+        }
+        StatusCode::NOT_FOUND => Err("No proofs found for this block".to_string()),
+        status => Err(format!("Request failed with status: {}", status)),
+    }
+}
 
 /// Generate a proof for an execution payload
 ///
-/// TODO(zkproofs): Currently generates dummy proofs. Will be replaced with actual proof generation
+/// TODO(zkproofs): Currently using Ethproofs API for proofs. Will be replaced with actual proof generation
 /// from zkVMs or other proof systems.
 ///
 /// This accepts the concrete ExecutionPayload<E> type which is what the EL expects
@@ -30,17 +169,17 @@ pub async fn generate_proof<T: EthSpec>(
     // Simulate (some) proof computation delay
     // In a real implementation, this would be the time needed for zkVM local proof generation
     // or communication with external proof generation services
-    use rand::{Rng, rng};
-    let delay_ms = rng().random_range(1000..=3000);
+    // use rand::{Rng, rng};
+    // let delay_ms = rng().random_range(1000..=3000);
 
-    debug!(
-        execution_block_hash = ?execution_block_hash,
-        subnet_id = *proof_id,
-        delay_ms,
-        "Simulating proof generation delay"
-    );
+    // debug!(
+    //     execution_block_hash = ?execution_block_hash,
+    //     subnet_id = *proof_id,
+    //     delay_ms,
+    //     "Simulating proof generation delay"
+    // );
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+    // tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
 
     // Create dummy proof data that includes the subnet information and payload details
     // In a real implementation, this would use the execution_state_witness to generate
@@ -54,7 +193,40 @@ pub async fn generate_proof<T: EthSpec>(
     )
     .into_bytes();
 
-    ExecutionProof::new(block_root, execution_block_hash, proof_id, 1, dummy_data)
+    // Download proofs from Ethproofs for PoC implementation.
+    let proof_data = match download_proofs_from_ethproofs(execution_block_hash).await {
+        Ok(archive) => {
+            debug!(
+                block_number,
+                subnet_id = *proof_id,
+                file_count = archive.files.len(),
+                "Downloaded proof archive from Ethproofs"
+            );
+
+            // Use the first file from the archive to test implementation.
+            if let Some(first_file) = archive.files.first() {
+                debug!(
+                    filename = %first_file.filename,
+                    size_bytes = first_file.data.len(),
+                    "Successfully using proof data from Ethproofs"
+                );
+                first_file.data.clone()
+            } else {
+                debug!("No proof files in archive, using fallback dummy data");
+                dummy_data.clone()
+            }
+        }
+        Err(e) => {
+            debug!(
+                error = %e,
+                block_number,
+                "Failed to download proofs from Ethproofs, using fallback dummy data"
+            );
+            dummy_data.clone()
+        }
+    };
+
+    ExecutionProof::new(block_root, execution_block_hash, proof_id, 1, proof_data)
 }
 
 /// Validate a proof (placeholder implementation)
