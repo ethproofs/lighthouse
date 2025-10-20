@@ -49,7 +49,7 @@ pub fn spawn_proof_generation_task_with_publishing<T, F>(
             // Get configured subnets for proof generation
             let proof_subnets = get_configured_proof_subnets(&chain_clone);
 
-            debug!(
+            info!(
                 execution_block_hash = ?execution_block_hash,
                 subnet_count = proof_subnets.len(),
                 subnets = ?proof_subnets,
@@ -65,6 +65,12 @@ pub fn spawn_proof_generation_task_with_publishing<T, F>(
                         continue;
                     }
                 };
+
+                info!(
+                    execution_block_hash = ?execution_block_hash,
+                    subnet_id,
+                    "Generating proof for subnet"
+                );
 
                 // Generate proof using the execution_proof_generation module
                 let proof = crate::execution_proof_generation::generate_proof(
