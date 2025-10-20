@@ -5,6 +5,7 @@
 //! actual proof generation from zkVMs or other proof systems.
 use reqwest::StatusCode;
 use std::io::{Cursor, Read};
+use std::str::FromStr;
 use tracing::debug;
 use types::{
     EthSpec, ExecutionPayload, ExecutionProof, Hash256,
@@ -166,6 +167,17 @@ pub async fn generate_proof<T: EthSpec>(
     let execution_block_hash = payload.block_hash();
     let block_number = payload.block_number();
 
+    // HARDCODED FOR TESTING: Override execution_block_hash for proof download
+    let hardcoded_hash = types::ExecutionBlockHash::from(
+        Hash256::from_str("0xccb695b6aaf1a935a8cff697559061921ac62a316c12fb8fc8c19a19b7fbd5a7")
+            .expect("Valid hardcoded hash"),
+    );
+    debug!(
+        original_hash = ?execution_block_hash,
+        hardcoded_hash = ?hardcoded_hash,
+        "Using hardcoded execution block hash for testing proof download"
+    );
+
     // Simulate (some) proof computation delay
     // In a real implementation, this would be the time needed for zkVM local proof generation
     // or communication with external proof generation services
@@ -194,7 +206,8 @@ pub async fn generate_proof<T: EthSpec>(
     .into_bytes();
 
     // Download proofs from Ethproofs for PoC implementation.
-    let proof_data = match download_proofs_from_ethproofs(execution_block_hash).await {
+    // Using hardcoded hash for testing
+    let proof_data = match download_proofs_from_ethproofs(hardcoded_hash).await {
         Ok(archive) => {
             debug!(
                 block_number,
