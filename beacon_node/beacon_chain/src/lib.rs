@@ -27,6 +27,7 @@ pub mod execution_proof_generation;
 pub mod execution_proof_network;
 pub mod execution_proof_verification;
 pub mod fetch_blobs;
+pub mod verification_keys;
 pub mod fork_choice_signal;
 pub mod fork_revert;
 pub mod graffiti_calculator;

@@ -19,6 +19,10 @@ pub struct ExecutionProof {
     pub subnet_id: ExecutionProofSubnetId,
     /// Version of the proof format - allows for one subnet to upgrade their proof without all needing to
     pub version: u64,
+    /// TODO(zkproofs): Used for Ethproofs implementation.
+    /// UUID bytes identifying the prover that generated this proof (16 bytes)
+    /// Can be converted to/from uuid::Uuid using Uuid::from_bytes() and uuid.as_bytes()
+    pub prover_id: [u8; 16],
     /// Opaque proof data - structure depends on subnet_id and version
     /// This will contain cryptographic proofs received via gossip
     pub proof_data: Vec<u8>,
@@ -31,6 +35,7 @@ impl ExecutionProof {
         block_hash: ExecutionBlockHash,
         subnet_id: ExecutionProofSubnetId,
         version: u64,
+        prover_id: [u8; 16],
         proof_data: Vec<u8>,
     ) -> Self {
         Self {
@@ -38,6 +43,7 @@ impl ExecutionProof {
             block_hash,
             subnet_id,
             version,
+            prover_id,
             proof_data,
         }
     }
@@ -74,14 +80,23 @@ mod tests {
         let block_root = Hash256::random();
         let block_hash = ExecutionBlockHash::from(Hash256::random());
         let subnet_id = ExecutionProofSubnetId::new(0).unwrap();
+        let prover_id = [1u8; 16]; // Dummy prover ID
         let proof_data = vec![1, 2, 3, 4];
 
-        let proof = ExecutionProof::new(block_root, block_hash, subnet_id, 1, proof_data.clone());
+        let proof = ExecutionProof::new(
+            block_root,
+            block_hash,
+            subnet_id,
+            1,
+            prover_id,
+            proof_data.clone(),
+        );
 
         assert_eq!(proof.block_root, block_root);
         assert_eq!(proof.block_hash, block_hash);
         assert_eq!(proof.subnet_id, subnet_id);
         assert_eq!(proof.version, 1);
+        assert_eq!(proof.prover_id, prover_id);
         assert_eq!(proof.proof_data, proof_data);
     }
 
@@ -90,20 +105,35 @@ mod tests {
         let block_root = Hash256::random();
         let block_hash = ExecutionBlockHash::from(Hash256::random());
         let subnet_id = ExecutionProofSubnetId::new(0).unwrap();
+        let prover_id = [2u8; 16];
 
         // Valid proof
-        let valid_proof = ExecutionProof::new(block_root, block_hash, subnet_id, 1, vec![1, 2, 3]);
+        let valid_proof = ExecutionProof::new(
+            block_root,
+            block_hash,
+            subnet_id,
+            1,
+            prover_id,
+            vec![1, 2, 3],
+        );
         assert!(valid_proof.is_version_supported());
         assert!(valid_proof.is_structurally_valid());
 
         // Invalid version
-        let invalid_version =
-            ExecutionProof::new(block_root, block_hash, subnet_id, 99, vec![1, 2, 3]);
+        let invalid_version = ExecutionProof::new(
+            block_root,
+            block_hash,
+            subnet_id,
+            99,
+            prover_id,
+            vec![1, 2, 3],
+        );
         assert!(!invalid_version.is_version_supported());
         assert!(!invalid_version.is_structurally_valid());
 
         // Empty proof data
-        let empty_proof = ExecutionProof::new(block_root, block_hash, subnet_id, 1, vec![]);
+        let empty_proof =
+            ExecutionProof::new(block_root, block_hash, subnet_id, 1, prover_id, vec![]);
         assert!(empty_proof.is_version_supported());
         assert!(!empty_proof.is_structurally_valid());
     }
@@ -112,12 +142,14 @@ mod tests {
     fn test_execution_proof_description() {
         let block_root = Hash256::random();
         let block_hash = ExecutionBlockHash::from(Hash256::random());
+        let prover_id = [3u8; 16];
 
         let witness_proof = ExecutionProof::new(
             block_root,
             block_hash,
             ExecutionProofSubnetId::new(0).unwrap(),
             1,
+            prover_id,
             vec![1, 2, 3],
         );
         assert_eq!(witness_proof.description(), "proof id 0");
@@ -128,9 +160,11 @@ mod tests {
         let block_root = Hash256::random();
         let block_hash = ExecutionBlockHash::from(Hash256::random());
         let subnet_id = ExecutionProofSubnetId::new(2).unwrap();
+        let prover_id = [4u8; 16];
         let proof_data = vec![10, 20, 30, 40, 50];
 
-        let original = ExecutionProof::new(block_root, block_hash, subnet_id, 1, proof_data);
+        let original =
+            ExecutionProof::new(block_root, block_hash, subnet_id, 1, prover_id, proof_data);
 
         // Test SSZ encoding and decoding
         let encoded = original.as_ssz_bytes();

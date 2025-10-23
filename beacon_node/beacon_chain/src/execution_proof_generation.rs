@@ -3,21 +3,43 @@
 //! This module handles the generation and verification of execution proofs.
 //! Currently implements dummy proof generation, but will be replaced with
 //! actual proof generation from zkVMs or other proof systems.
+use crate::verification_keys::VerificationKeyStore;
+use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use std::io::{Cursor, Read};
+use std::path::Path;
 use std::str::FromStr;
-use tracing::debug;
+use tracing::{debug, warn};
 use types::{
     EthSpec, ExecutionPayload, ExecutionProof, Hash256,
     execution_proof_subnet_id::ExecutionProofSubnetId,
 };
+use uuid::Uuid;
 use zip::ZipArchive;
+
+/// Global verification key store, loaded once on first access
+pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
+    Lazy::new(|| match VerificationKeyStore::load_embedded() {
+        Ok(store) => {
+            debug!(
+                key_count = store.len(),
+                prover_ids = ?store.prover_ids(),
+                "Loaded verification keys"
+            );
+            Some(store)
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to load verification keys");
+            None
+        }
+    });
 
 /// Represents a single proof file extracted from the ZIP archive
 #[derive(Debug, Clone)]
 pub struct ProofFile {
-    /// The name of the file in the ZIP archive
-    pub filename: String,
+    /// UUID bytes identifying the prover that generated this proof (16 bytes)
+    /// Extracted from filename pattern: {name}_{uuid}.bin
+    pub prover_id: [u8; 16],
     /// The binary content of the proof file
     pub data: Vec<u8>,
 }
@@ -30,15 +52,44 @@ pub struct ProofArchive {
 }
 
 impl ProofArchive {
-    /// Find a proof file by its filename
-    pub fn find_file(&self, filename: &str) -> Option<&ProofFile> {
-        self.files.iter().find(|f| f.filename == filename)
+    /// Find a proof file by its prover_id
+    pub fn find_by_prover(&self, prover_id: &[u8; 16]) -> Option<&ProofFile> {
+        self.files.iter().find(|f| &f.prover_id == prover_id)
     }
+}
 
-    /// Get all filenames in the archive
-    pub fn filenames(&self) -> Vec<&str> {
-        self.files.iter().map(|f| f.filename.as_str()).collect()
-    }
+/// Extract prover_id from filename pattern: {name}_{uuid}.bin or {name}_{uuid}.{ext}
+///
+/// Example: "brevis_4eb78a0b-61c1-464f-80f2-20f1f56aea73.bin" -> [4e, b7, 8a, 0b, ...]
+fn extract_prover_id_from_filename(filename: &str) -> Result<[u8; 16], String> {
+    // Get the file stem (filename without extension)
+    let path = Path::new(filename);
+    let file_stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("Invalid filename: {}", filename))?;
+
+    // Split on '_' and get the second part (index [1]) which should be the UUID
+    let parts: Vec<&str> = file_stem.split('_').collect();
+    let uuid_str = if parts.len() >= 2 {
+        parts[1]
+    } else {
+        return Err(format!(
+            "Filename '{}' does not match pattern {{name}}_{{uuid}}",
+            filename
+        ));
+    };
+
+    // Parse the UUID string
+    let uuid = Uuid::parse_str(uuid_str).map_err(|e| {
+        format!(
+            "Failed to parse UUID '{}' from filename '{}': {}",
+            uuid_str, filename, e
+        )
+    })?;
+
+    // Convert UUID to bytes
+    Ok(*uuid.as_bytes())
 }
 
 /// Extract all files from a ZIP archive
@@ -65,6 +116,9 @@ fn extract_zip_archive(zip_bytes: &[u8]) -> Result<ProofArchive, String> {
 
         let filename = file.name().to_string();
 
+        // Extract prover_id from filename pattern: {name}_{uuid}.bin
+        let prover_id = extract_prover_id_from_filename(&filename)?;
+
         // Read the file contents into a buffer
         let mut data = Vec::new();
         file.read_to_end(&mut data)
@@ -72,11 +126,12 @@ fn extract_zip_archive(zip_bytes: &[u8]) -> Result<ProofArchive, String> {
 
         debug!(
             filename = %filename,
+            prover_id = ?prover_id,
             size_bytes = data.len(),
             "Extracted proof file from ZIP archive"
         );
 
-        files.push(ProofFile { filename, data });
+        files.push(ProofFile { prover_id, data });
     }
 
     if files.is_empty() {
@@ -98,56 +153,86 @@ fn extract_zip_archive(zip_bytes: &[u8]) -> Result<ProofArchive, String> {
 /// This accepts the block hash and returns the extracted proof files.
 /// The API response should be a ZIP file containing multiple binary proof files.
 ///
-/// # Example Usage
-///
-/// ```ignore
-/// // Download proofs for a block
-/// let archive = download_proofs_from_ethproofs(12345).await?;
-///
-/// // List all files in the archive
-/// for filename in archive.filenames() {
-///     println!("Found proof file: {}", filename);
-/// }
-///
-/// // Access a specific proof file by name
-/// if let Some(proof_file) = archive.find_file("proof_0.bin") {
-///     println!("Proof size: {} bytes", proof_file.data.len());
-///     // Use the binary data: proof_file.data
-/// }
-///
-/// // Iterate through all files
-/// for file in &archive.files {
-///     println!("Processing {}: {} bytes", file.filename, file.data.len());
-///     // Process each binary proof file
-/// }
-/// ```
 async fn download_proofs_from_ethproofs(
     block_hash: types::ExecutionBlockHash,
 ) -> Result<ProofArchive, String> {
+    const MAX_RETRIES: u32 = 1; // Set to 1 for testing, change to 10 for production.
+    const INITIAL_DELAY_MS: u64 = 100;
+    const MAX_DELAY_MS: u64 = 5000;
+
     let client = reqwest::Client::new();
-    let response = client
-        .get(format!(
-            "https://ethproofs.org/api/v0/proofs/download/block/{}",
-            block_hash
-        ))
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+    let url = format!(
+        "https://ethproofs.org/api/v0/proofs/download/block/{}",
+        block_hash
+    );
 
-    match response.status() {
-        StatusCode::OK => {
-            // Download the ZIP file as bytes
-            let zip_bytes = response
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read response: {}", e))?;
+    let mut delay_ms = INITIAL_DELAY_MS;
 
-            // Extract the ZIP contents
-            extract_zip_archive(&zip_bytes)
+    for attempt in 1..=MAX_RETRIES {
+        debug!(
+            block_hash = %block_hash,
+            attempt,
+            delay_ms,
+            "Attempting to download proofs from Ethproofs"
+        );
+
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        match response.status() {
+            StatusCode::OK => {
+                debug!(
+                    block_hash = %block_hash,
+                    attempt,
+                    "Successfully downloaded proofs from Ethproofs"
+                );
+
+                // Download the ZIP file as bytes
+                let zip_bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("Failed to read response: {}", e))?;
+
+                // Extract the ZIP contents
+                return extract_zip_archive(&zip_bytes);
+            }
+            StatusCode::NOT_FOUND => {
+                if attempt == MAX_RETRIES {
+                    return Err(format!(
+                        "No proofs found for block {} after {} attempts",
+                        block_hash, MAX_RETRIES
+                    ));
+                }
+
+                debug!(
+                    block_hash = %block_hash,
+                    attempt,
+                    next_delay_ms = delay_ms,
+                    "Proofs not ready yet, retrying..."
+                );
+
+                // Wait before retrying
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+
+                // Exponential backoff: double the delay, up to MAX_DELAY_MS
+                delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+            }
+            status => {
+                return Err(format!(
+                    "Request failed with status: {} for block {}",
+                    status, block_hash
+                ));
+            }
         }
-        StatusCode::NOT_FOUND => Err("No proofs found for this block".to_string()),
-        status => Err(format!("Request failed with status: {}", status)),
     }
+
+    Err(format!(
+        "Failed to download proofs for block {} after {} attempts",
+        block_hash, MAX_RETRIES
+    ))
 }
 
 /// Generate a proof for an execution payload
@@ -167,32 +252,6 @@ pub async fn generate_proof<T: EthSpec>(
     let execution_block_hash = payload.block_hash();
     let block_number = payload.block_number();
 
-    // HARDCODED FOR TESTING: Override execution_block_hash for proof download
-    let hardcoded_hash = types::ExecutionBlockHash::from(
-        Hash256::from_str("0xccb695b6aaf1a935a8cff697559061921ac62a316c12fb8fc8c19a19b7fbd5a7")
-            .expect("Valid hardcoded hash"),
-    );
-    debug!(
-        original_hash = ?execution_block_hash,
-        hardcoded_hash = ?hardcoded_hash,
-        "Using hardcoded execution block hash for testing proof download"
-    );
-
-    // Simulate (some) proof computation delay
-    // In a real implementation, this would be the time needed for zkVM local proof generation
-    // or communication with external proof generation services
-    // use rand::{Rng, rng};
-    // let delay_ms = rng().random_range(1000..=3000);
-
-    // debug!(
-    //     execution_block_hash = ?execution_block_hash,
-    //     subnet_id = *proof_id,
-    //     delay_ms,
-    //     "Simulating proof generation delay"
-    // );
-
-    // tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-
     // Create dummy proof data that includes the subnet information and payload details
     // In a real implementation, this would use the execution_state_witness to generate
     // a cryptographic proof of the payload's validity
@@ -205,9 +264,41 @@ pub async fn generate_proof<T: EthSpec>(
     )
     .into_bytes();
 
+    // TEMPORARY FOR TESTING: Only generate proofs for blocks ending in '00' (1/100 blocks)
+    if block_number % 100 != 0 {
+        debug!(
+            block_number,
+            "Skipping proof generation - block number does not end in '00'"
+        );
+        // Return a minimal dummy proof for non-targeted blocks
+        return ExecutionProof::new(
+            block_root,
+            execution_block_hash,
+            proof_id,
+            1,
+            [0u8; 16], // Placeholder prover_id
+            dummy_data.clone(),
+        );
+    }
+
+    debug!(
+        block_number,
+        "Block number ends in '00' - proceeding with proof generation"
+    );
+
+    // HARDCODED FOR TESTING: Override execution_block_hash for proof download
+    let hardcoded_hash = types::ExecutionBlockHash::from(
+        Hash256::from_str("0xe984074498ffba32c502b59a0324e98c6b8c22527c9a7339c635ddcd65997211")
+            .expect("Valid hardcoded hash"),
+    );
+    debug!(
+        original_hash = ?execution_block_hash,
+        hardcoded_hash = ?hardcoded_hash,
+        "Using hardcoded execution block hash for testing proof download"
+    );
+
     // Download proofs from Ethproofs for PoC implementation.
-    // Using hardcoded hash for testing
-    let proof_data = match download_proofs_from_ethproofs(hardcoded_hash).await {
+    let (proof_data, prover_id) = match download_proofs_from_ethproofs(hardcoded_hash).await {
         Ok(archive) => {
             debug!(
                 block_number,
@@ -219,14 +310,14 @@ pub async fn generate_proof<T: EthSpec>(
             // Use the first file from the archive to test implementation.
             if let Some(first_file) = archive.files.first() {
                 debug!(
-                    filename = %first_file.filename,
+                    prover_id = ?first_file.prover_id,
                     size_bytes = first_file.data.len(),
                     "Successfully using proof data from Ethproofs"
                 );
-                first_file.data.clone()
+                (first_file.data.clone(), first_file.prover_id)
             } else {
                 debug!("No proof files in archive, using fallback dummy data");
-                dummy_data.clone()
+                (dummy_data.clone(), [0u8; 16])
             }
         }
         Err(e) => {
@@ -235,26 +326,65 @@ pub async fn generate_proof<T: EthSpec>(
                 block_number,
                 "Failed to download proofs from Ethproofs, using fallback dummy data"
             );
-            dummy_data.clone()
+            (dummy_data.clone(), [0u8; 16])
         }
     };
 
-    ExecutionProof::new(block_root, execution_block_hash, proof_id, 1, proof_data)
+    ExecutionProof::new(
+        block_root,
+        execution_block_hash,
+        proof_id,
+        1,
+        prover_id,
+        proof_data,
+    )
 }
 
-/// Validate a proof (placeholder implementation)
+/// Validate a proof (Ethproofs placeholder implementation)
 ///
 /// TODO(zkproofs): Implement actual cryptographic proof validation based on version and type
 pub fn validate_proof(proof: &ExecutionProof) -> bool {
-    // Placeholder validation - in reality this would verify cryptographic proofs
-    // based on both proof_id and version
-    match proof.version {
-        1 => {
-            // Version 1: basic validation - non-empty proof data
-            !proof.proof_data.is_empty()
+    match &*VERIFICATION_KEY_STORE {
+        Some(store) => {
+            // Convert prover_id bytes to Uuid for lookup
+            let prover_uuid = Uuid::from_bytes(proof.prover_id);
+
+            match store.get(&prover_uuid) {
+                Some(vk) => {
+                    debug!(
+                        prover_id = %prover_uuid,
+                        vk_size = vk.size(),
+                        proof_version = proof.version,
+                        proof_size = proof.proof_data.len(),
+                        "Found verification key for prover"
+                    );
+
+                    // TODO(zkproofs): Implement actual cryptographic verification
+                    // For now, just check that we have the key and proof data is non-empty
+                    match proof.version {
+                        1 => {
+                            // Placeholder: In production, this would call:
+                            // verify_proof_v1(&proof.proof_data, &vk.vk)
+                            !proof.proof_data.is_empty()
+                        }
+                        _ => {
+                            warn!(version = proof.version, "Unknown proof version");
+                            false
+                        }
+                    }
+                }
+                None => {
+                    warn!(
+                        prover_id = %prover_uuid,
+                        available_keys = store.len(),
+                        "No verification key found for prover"
+                    );
+                    false
+                }
+            }
         }
-        _ => {
-            // Unknown versions are considered invalid
+        None => {
+            warn!("Verification key store failed to initialize");
             false
         }
     }
@@ -320,6 +450,7 @@ mod tests {
             hash,
             ExecutionProofSubnetId::new(0).unwrap(),
             1,
+            [1u8; 16],
             vec![1, 2, 3],
         );
         assert!(validate_proof(&v1_proof));
@@ -330,6 +461,7 @@ mod tests {
             hash,
             ExecutionProofSubnetId::new(0).unwrap(),
             2,
+            [2u8; 16],
             vec![7, 8, 9],
         );
         assert!(!validate_proof(&v2_proof)); // Should fail validation for unknown version
@@ -340,6 +472,7 @@ mod tests {
             hash,
             ExecutionProofSubnetId::new(0).unwrap(),
             1,
+            [3u8; 16],
             vec![],
         );
         assert!(!validate_proof(&empty_v1));

@@ -914,6 +914,7 @@ dependencies = [
  "tree_hash",
  "tree_hash_derive",
  "types",
+ "uuid 0.8.2",
  "zip",
  "zstd 0.13.3",
 ]
@@ -9929,6 +9930,7 @@ dependencies = [
  "tracing",
  "tree_hash",
  "tree_hash_derive",
+ "uuid 0.8.2",
 ]
 
 [[package]]
