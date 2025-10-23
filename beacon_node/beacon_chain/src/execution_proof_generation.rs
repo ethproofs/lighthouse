@@ -4,6 +4,7 @@
 //! Currently implements dummy proof generation, but will be replaced with
 //! actual proof generation from zkVMs or other proof systems.
 use crate::verification_keys::VerificationKeyStore;
+use crate::verifiers::VerifierStore;
 use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use std::io::{Cursor, Read};
@@ -33,6 +34,13 @@ pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
             None
         }
     });
+
+/// Global verifier store, initialized with default verifiers
+pub static VERIFIER_STORE: Lazy<VerifierStore> = Lazy::new(|| {
+    let store = VerifierStore::with_defaults();
+    debug!(verifier_count = store.len(), "Initialized verifier store");
+    store
+});
 
 /// Represents a single proof file extracted from the ZIP archive
 #[derive(Debug, Clone)]
@@ -308,6 +316,7 @@ pub async fn generate_proof<T: EthSpec>(
             );
 
             // Use the first file from the archive to test implementation.
+            // The should be a brevis proof for testing purposes.
             if let Some(first_file) = archive.files.first() {
                 debug!(
                     prover_id = ?first_file.prover_id,
@@ -359,16 +368,40 @@ pub fn validate_proof(proof: &ExecutionProof) -> bool {
                         "Found verification key for prover"
                     );
 
-                    // TODO(zkproofs): Implement actual cryptographic verification
-                    // For now, just check that we have the key and proof data is non-empty
-                    match proof.version {
-                        1 => {
-                            // Placeholder: In production, this would call:
-                            // verify_proof_v1(&proof.proof_data, &vk.vk)
-                            !proof.proof_data.is_empty()
+                    // Look up the verifier for this prover
+                    match VERIFIER_STORE.get(&prover_uuid) {
+                        Some(verifier_entry) => {
+                            debug!(
+                                prover_id = %prover_uuid,
+                                verifier = verifier_entry.name,
+                                "Found verifier, running cryptographic verification"
+                            );
+
+                            // Run the actual cryptographic verification
+                            match (verifier_entry.verify_fn)(&proof.proof_data, &vk.vk) {
+                                Ok(result) => {
+                                    debug!(
+                                        prover_id = %prover_uuid,
+                                        verification_result = result,
+                                        "Verification completed"
+                                    );
+                                    result
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        prover_id = %prover_uuid,
+                                        error = %e,
+                                        "Verification failed with error"
+                                    );
+                                    false
+                                }
+                            }
                         }
-                        _ => {
-                            warn!(version = proof.version, "Unknown proof version");
+                        None => {
+                            warn!(
+                                prover_id = %prover_uuid,
+                                "No verifier registered for this prover, cannot verify proof"
+                            );
                             false
                         }
                     }
