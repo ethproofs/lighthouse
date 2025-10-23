@@ -272,11 +272,11 @@ pub async fn generate_proof<T: EthSpec>(
     )
     .into_bytes();
 
-    // TEMPORARY FOR TESTING: Only generate proofs for blocks ending in '00' (1/100 blocks)
-    if block_number % 100 != 0 {
+    // TEMPORARY FOR TESTING: Only generate proofs for blocks ending in '0' (1/10 blocks)
+    if block_number % 10 != 0 {
         debug!(
             block_number,
-            "Skipping proof generation - block number does not end in '00'"
+            "Skipping proof generation - block number does not end in '0'"
         );
         // Return a minimal dummy proof for non-targeted blocks
         return ExecutionProof::new(
@@ -291,7 +291,7 @@ pub async fn generate_proof<T: EthSpec>(
 
     debug!(
         block_number,
-        "Block number ends in '00' - proceeding with proof generation"
+        "Block number ends in '0' - proceeding with proof generation"
     );
 
     // HARDCODED FOR TESTING: Override execution_block_hash for proof download
@@ -339,14 +339,30 @@ pub async fn generate_proof<T: EthSpec>(
         }
     };
 
-    ExecutionProof::new(
+    let proof = ExecutionProof::new(
         block_root,
         execution_block_hash,
         proof_id,
         1,
         prover_id,
         proof_data,
-    )
+    );
+
+    // TEMPORARY FOR TESTING: Validate the proof immediately after generation
+    debug!(
+        block_number,
+        prover_id = ?proof.prover_id,
+        "Testing proof validation immediately after generation"
+    );
+    let is_valid = validate_proof(&proof);
+    debug!(
+        block_number,
+        prover_id = ?proof.prover_id,
+        validation_result = is_valid,
+        "Proof validation test completed"
+    );
+
+    proof
 }
 
 /// Validate a proof (Ethproofs placeholder implementation)

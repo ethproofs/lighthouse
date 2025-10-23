@@ -3,7 +3,7 @@
 //! This module manages different proof verification systems based on prover type.
 //! Each verifier implements cryptographic proof verification for a specific zkVM or proof system.
 
-pub mod pico_verifier;
+pub mod pico;
 
 use std::collections::HashMap;
 use uuid::Uuid;
