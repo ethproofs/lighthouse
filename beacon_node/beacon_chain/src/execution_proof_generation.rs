@@ -43,10 +43,9 @@ pub static VERIFIER_STORE: Lazy<VerifierStore> = Lazy::new(|| {
 });
 
 /// Select a random prover_id from available registered verifiers
-///
-/// TEMPORARY FOR TESTING: Currently hardcoded to return ZisK prover_id
-/// In production, this should randomly select from available provers
 fn select_random_prover_id() -> [u8; 16] {
+    use rand::Rng;
+
     let available_provers = VERIFIER_STORE.prover_ids();
 
     if available_provers.is_empty() {
@@ -54,28 +53,16 @@ fn select_random_prover_id() -> [u8; 16] {
         return [0u8; 16];
     }
 
-    // TEMPORARY: Hardcoded to ZisK for testing
-    let zisk_uuid =
-        Uuid::parse_str("787d9474-1181-43fd-936e-9b15976a0308").expect("Valid ZisK UUID");
+    let random_index = rand::rng().random_range(0..available_provers.len());
+    let selected_uuid = available_provers[random_index];
 
     debug!(
-        prover_id = %zisk_uuid,
+        prover_id = %selected_uuid,
         available_count = available_provers.len(),
-        "Selected ZisK prover_id"
+        "Randomly selected prover_id"
     );
 
-    *zisk_uuid.as_bytes()
-
-    // TODO(zkproofs): Enable random selection once testing is complete
-    // use rand::Rng;
-    // let random_index = rand::thread_rng().gen_range(0..available_provers.len());
-    // let selected_uuid = available_provers[random_index];
-    // debug!(
-    //     prover_id = %selected_uuid,
-    //     available_count = available_provers.len(),
-    //     "Randomly selected prover_id"
-    // );
-    // *selected_uuid.as_bytes()
+    *selected_uuid.as_bytes()
 }
 
 /// Represents a single proof file extracted from the ZIP archive
