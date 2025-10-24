@@ -44,6 +44,7 @@ oneshot_broadcast = { path = "../../common/oneshot_broadcast/" }
 operation_pool = { workspace = true }
 parking_lot = { workspace = true }
 pico-vm = { git = "https://github.com/ethproofs/pico.git", package = "pico-vm", branch = "wasm-stark-verifier" }
+proofman-verifier = { git = "https://github.com/0xPolygonHermez/pil2-proofman.git", tag = "v0.12.0" }
 bincode = { workspace = true }
 proto_array = { workspace = true }
 rand = { workspace = true }

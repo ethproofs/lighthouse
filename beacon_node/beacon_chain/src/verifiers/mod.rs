@@ -4,6 +4,7 @@
 //! Each verifier implements cryptographic proof verification for a specific zkVM or proof system.
 
 pub mod pico;
+pub mod zisk;
 
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -74,6 +75,11 @@ impl VerifierStore {
         self.verifiers.is_empty()
     }
 
+    /// Get all registered prover IDs
+    pub fn prover_ids(&self) -> Vec<Uuid> {
+        self.verifiers.keys().copied().collect()
+    }
+
     /// Create a store with default verifiers registered
     ///
     /// This registers verifiers for known prover UUIDs
@@ -81,16 +87,27 @@ impl VerifierStore {
         let mut store = Self::new();
 
         // Register verifiers for known prover UUIDs
-        // Current options from verification_keys directory:
-        // - brevis: 4eb78a0b-61c1-464f-80f2-20f1f56aea73
-        // - zisk:   787d9474-1181-43fd-936e-9b15976a0308
-        // - zkm:    84a01f4b-8078-44cf-b463-90ddcd124960
+        // Current verification_keys directory mapping:
+        // - brevis: 4eb78a0b-61c1-464f-80f2-20f1f56aea73 -> Pico verifier
+        // - zisk:   787d9474-1181-43fd-936e-9b15976a0308 -> ZisK verifier
+        // - zkm:    84a01f4b-8078-44cf-b463-90ddcd124960 -> (not yet implemented)
+
+        // Register Pico verifier for brevis
         let brevis_uuid =
             Uuid::parse_str("4eb78a0b-61c1-464f-80f2-20f1f56aea73").expect("Valid UUID");
         store.register(
             brevis_uuid,
             pico::PicoVerifier::name(),
             pico::PicoVerifier::verify,
+        );
+
+        // Register ZisK verifier
+        let zisk_uuid =
+            Uuid::parse_str("787d9474-1181-43fd-936e-9b15976a0308").expect("Valid UUID");
+        store.register(
+            zisk_uuid,
+            zisk::ZiskVerifier::name(),
+            zisk::ZiskVerifier::verify,
         );
 
         store

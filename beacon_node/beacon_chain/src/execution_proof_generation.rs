@@ -42,6 +42,42 @@ pub static VERIFIER_STORE: Lazy<VerifierStore> = Lazy::new(|| {
     store
 });
 
+/// Select a random prover_id from available registered verifiers
+///
+/// TEMPORARY FOR TESTING: Currently hardcoded to return ZisK prover_id
+/// In production, this should randomly select from available provers
+fn select_random_prover_id() -> [u8; 16] {
+    let available_provers = VERIFIER_STORE.prover_ids();
+
+    if available_provers.is_empty() {
+        warn!("No verifiers registered, cannot select prover_id");
+        return [0u8; 16];
+    }
+
+    // TEMPORARY: Hardcoded to ZisK for testing
+    let zisk_uuid =
+        Uuid::parse_str("787d9474-1181-43fd-936e-9b15976a0308").expect("Valid ZisK UUID");
+
+    debug!(
+        prover_id = %zisk_uuid,
+        available_count = available_provers.len(),
+        "Selected ZisK prover_id"
+    );
+
+    *zisk_uuid.as_bytes()
+
+    // TODO(zkproofs): Enable random selection once testing is complete
+    // use rand::Rng;
+    // let random_index = rand::thread_rng().gen_range(0..available_provers.len());
+    // let selected_uuid = available_provers[random_index];
+    // debug!(
+    //     prover_id = %selected_uuid,
+    //     available_count = available_provers.len(),
+    //     "Randomly selected prover_id"
+    // );
+    // *selected_uuid.as_bytes()
+}
+
 /// Represents a single proof file extracted from the ZIP archive
 #[derive(Debug, Clone)]
 pub struct ProofFile {
@@ -305,6 +341,9 @@ pub async fn generate_proof<T: EthSpec>(
         "Using hardcoded execution block hash for testing proof download"
     );
 
+    // Select a prover_id to test (currently hardcoded to ZisK)
+    let selected_prover_id = select_random_prover_id();
+
     // Download proofs from Ethproofs for PoC implementation.
     let (proof_data, prover_id) = match download_proofs_from_ethproofs(hardcoded_hash).await {
         Ok(archive) => {
@@ -312,21 +351,27 @@ pub async fn generate_proof<T: EthSpec>(
                 block_number,
                 subnet_id = *proof_id,
                 file_count = archive.files.len(),
+                selected_prover = ?selected_prover_id,
                 "Downloaded proof archive from Ethproofs"
             );
 
-            // Use the first file from the archive to test implementation.
-            // The should be a brevis proof for testing purposes.
-            if let Some(first_file) = archive.files.first() {
+            // Try to find a proof matching the selected prover_id
+            if let Some(matching_proof) = archive.find_by_prover(&selected_prover_id) {
+                let prover_uuid = Uuid::from_bytes(selected_prover_id);
                 debug!(
-                    prover_id = ?first_file.prover_id,
-                    size_bytes = first_file.data.len(),
-                    "Successfully using proof data from Ethproofs"
+                    prover_id = %prover_uuid,
+                    size_bytes = matching_proof.data.len(),
+                    "Found matching proof for selected prover in archive"
                 );
-                (first_file.data.clone(), first_file.prover_id)
+                (matching_proof.data.clone(), matching_proof.prover_id)
             } else {
-                debug!("No proof files in archive, using fallback dummy data");
-                (dummy_data.clone(), [0u8; 16])
+                let prover_uuid = Uuid::from_bytes(selected_prover_id);
+                warn!(
+                    prover_id = %prover_uuid,
+                    available_proofs = archive.files.len(),
+                    "No proof found for selected prover, using fallback dummy data"
+                );
+                (dummy_data.clone(), selected_prover_id)
             }
         }
         Err(e) => {
@@ -335,7 +380,7 @@ pub async fn generate_proof<T: EthSpec>(
                 block_number,
                 "Failed to download proofs from Ethproofs, using fallback dummy data"
             );
-            (dummy_data.clone(), [0u8; 16])
+            (dummy_data.clone(), selected_prover_id)
         }
     };
 
