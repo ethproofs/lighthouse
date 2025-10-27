@@ -8,7 +8,6 @@ use crate::verifiers::VerifierStore;
 use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 use tracing::{debug, warn};
 use types::{
     EthSpec, ExecutionPayload, ExecutionProof, Hash256,
@@ -85,7 +84,7 @@ struct ProofsListResponse {
 /// This accepts the block hash and returns a list of available proofs.
 ///
 async fn fetch_proofs_list(block_hash: types::ExecutionBlockHash) -> Result<Vec<Ethproof>, String> {
-    const MAX_RETRIES: u32 = 10;
+    const MAX_RETRIES: u32 = 60;
     const INITIAL_DELAY_MS: u64 = 100;
     const MAX_DELAY_MS: u64 = 5000;
     const LIMIT: u32 = 5;
@@ -237,11 +236,11 @@ pub async fn generate_proof<T: EthSpec>(
     )
     .into_bytes();
 
-    // TEMPORARY FOR TESTING: Only generate proofs for blocks ending in '0' (1/10 blocks)
-    if block_number % 10 != 0 {
+    // TEMPORARY FOR TESTING: Only generate proofs for blocks ending in '00' (1/100 blocks)
+    if block_number % 100 != 0 {
         debug!(
             block_number,
-            "Skipping proof generation - block number does not end in '0'"
+            "Skipping proof generation - block number does not end in '00'"
         );
         // Return a minimal dummy proof for non-targeted blocks
         return ExecutionProof::new(
@@ -256,18 +255,7 @@ pub async fn generate_proof<T: EthSpec>(
 
     debug!(
         block_number,
-        "Block number ends in '0' - proceeding with proof generation"
-    );
-
-    // HARDCODED FOR TESTING: Override execution_block_hash for proof download
-    let hardcoded_hash = types::ExecutionBlockHash::from(
-        Hash256::from_str("0xe984074498ffba32c502b59a0324e98c6b8c22527c9a7339c635ddcd65997211")
-            .expect("Valid hardcoded hash"),
-    );
-    debug!(
-        original_hash = ?execution_block_hash,
-        hardcoded_hash = ?hardcoded_hash,
-        "Using hardcoded execution block hash for testing proof download"
+        "Block number ends in '00' - proceeding with proof generation"
     );
 
     use rand::Rng;
@@ -285,7 +273,7 @@ pub async fn generate_proof<T: EthSpec>(
     );
 
     // Fetch proofs list from Ethproofs (polls until we get proofs)
-    let (proof_data, prover_id_bytes) = match fetch_proofs_list(hardcoded_hash).await {
+    let (proof_data, prover_id_bytes) = match fetch_proofs_list(execution_block_hash).await {
         Ok(provers) => {
             debug!(
                 block_number,
