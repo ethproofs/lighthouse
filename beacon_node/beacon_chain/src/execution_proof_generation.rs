@@ -414,30 +414,14 @@ pub async fn generate_proof<T: EthSpec>(
         }
     };
 
-    let proof = ExecutionProof::new(
+    ExecutionProof::new(
         block_root,
         execution_block_hash,
         proof_id,
         1,
         prover_id_bytes,
         proof_data,
-    );
-
-    // TEMPORARY FOR TESTING: Validate the proof immediately after generation
-    debug!(
-        block_number,
-        prover_id = ?proof.prover_id,
-        "Testing proof validation immediately after generation"
-    );
-    let is_valid = validate_proof(&proof);
-    debug!(
-        block_number,
-        prover_id = ?proof.prover_id,
-        validation_result = is_valid,
-        "Proof validation test completed"
-    );
-
-    proof
+    )
 }
 
 /// Validate a proof (Ethproofs placeholder implementation)
