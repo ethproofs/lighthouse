@@ -7,8 +7,7 @@ use crate::verification_keys::VerificationKeyStore;
 use crate::verifiers::VerifierStore;
 use once_cell::sync::Lazy;
 use reqwest::StatusCode;
-use std::io::{Cursor, Read};
-use std::path::Path;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::{debug, warn};
 use types::{
@@ -16,7 +15,6 @@ use types::{
     execution_proof_subnet_id::ExecutionProofSubnetId,
 };
 use uuid::Uuid;
-use zip::ZipArchive;
 
 /// Global verification key store, loaded once on first access
 pub static VERIFICATION_KEY_STORE: Lazy<Option<VerificationKeyStore>> =
@@ -53,7 +51,8 @@ fn select_random_prover_id() -> [u8; 16] {
         return [0u8; 16];
     }
 
-    let random_index = rand::rng().random_range(0..available_provers.len());
+    let mut rng = rand::rng();
+    let random_index = rng.random_range(0..available_provers.len());
     let selected_uuid = available_provers[random_index];
 
     debug!(
@@ -65,136 +64,36 @@ fn select_random_prover_id() -> [u8; 16] {
     *selected_uuid.as_bytes()
 }
 
-/// Represents a single proof file extracted from the ZIP archive
-#[derive(Debug, Clone)]
-pub struct ProofFile {
-    /// UUID bytes identifying the prover that generated this proof (16 bytes)
-    /// Extracted from filename pattern: {name}_{uuid}.bin
-    pub prover_id: [u8; 16],
-    /// The binary content of the proof file
-    pub data: Vec<u8>,
+/// Represents a proof from the Ethproofs proofs list endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Ethproof {
+    /// The proof ID from Ethproofs
+    proof_id: u64,
+    /// The cluster ID that generated this proof (matches against available prover_ids)
+    cluster_id: String,
 }
 
-/// Collection of proof files extracted from a ZIP archive
-#[derive(Debug)]
-pub struct ProofArchive {
-    /// All proof files extracted from the archive
-    pub files: Vec<ProofFile>,
+/// Represents the response from the Ethproofs proofs list endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProofsListResponse {
+    proofs: Vec<Ethproof>,
 }
 
-impl ProofArchive {
-    /// Find a proof file by its prover_id
-    pub fn find_by_prover(&self, prover_id: &[u8; 16]) -> Option<&ProofFile> {
-        self.files.iter().find(|f| &f.prover_id == prover_id)
-    }
-}
-
-/// Extract prover_id from filename pattern: {name}_{uuid}.bin or {name}_{uuid}.{ext}
+/// Fetch the list of proofs for a block from Ethproofs API.
 ///
-/// Example: "brevis_4eb78a0b-61c1-464f-80f2-20f1f56aea73.bin" -> [4e, b7, 8a, 0b, ...]
-fn extract_prover_id_from_filename(filename: &str) -> Result<[u8; 16], String> {
-    // Get the file stem (filename without extension)
-    let path = Path::new(filename);
-    let file_stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("Invalid filename: {}", filename))?;
-
-    // Split on '_' and get the second part (index [1]) which should be the UUID
-    let parts: Vec<&str> = file_stem.split('_').collect();
-    let uuid_str = if parts.len() >= 2 {
-        parts[1]
-    } else {
-        return Err(format!(
-            "Filename '{}' does not match pattern {{name}}_{{uuid}}",
-            filename
-        ));
-    };
-
-    // Parse the UUID string
-    let uuid = Uuid::parse_str(uuid_str).map_err(|e| {
-        format!(
-            "Failed to parse UUID '{}' from filename '{}': {}",
-            uuid_str, filename, e
-        )
-    })?;
-
-    // Convert UUID to bytes
-    Ok(*uuid.as_bytes())
-}
-
-/// Extract all files from a ZIP archive
-fn extract_zip_archive(zip_bytes: &[u8]) -> Result<ProofArchive, String> {
-    // Create a cursor over the bytes to allow reading
-    let cursor = Cursor::new(zip_bytes);
-
-    // Open the ZIP archive
-    let mut archive =
-        ZipArchive::new(cursor).map_err(|e| format!("Failed to open ZIP archive: {}", e))?;
-
-    let mut files = Vec::new();
-
-    // Iterate through all files in the archive
-    for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| format!("Failed to access file at index {}: {}", i, e))?;
-
-        // Skip directories
-        if file.is_dir() {
-            continue;
-        }
-
-        let filename = file.name().to_string();
-
-        // Extract prover_id from filename pattern: {name}_{uuid}.bin
-        let prover_id = extract_prover_id_from_filename(&filename)?;
-
-        // Read the file contents into a buffer
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)
-            .map_err(|e| format!("Failed to read file '{}': {}", filename, e))?;
-
-        debug!(
-            filename = %filename,
-            prover_id = ?prover_id,
-            size_bytes = data.len(),
-            "Extracted proof file from ZIP archive"
-        );
-
-        files.push(ProofFile { prover_id, data });
-    }
-
-    if files.is_empty() {
-        return Err("ZIP archive contains no files".to_string());
-    }
-
-    debug!(
-        file_count = files.len(),
-        "Successfully extracted all files from ZIP archive"
-    );
-
-    Ok(ProofArchive { files })
-}
-
-/// Download and extract proofs from Ethproofs for PoC implementation.
+/// Polls the endpoint until at least one proof is available, using exponential backoff.
+/// This accepts the block hash and returns a list of available proofs.
 ///
-/// TODO(zkproofs): Remove with actual proof generation.
-///
-/// This accepts the block hash and returns the extracted proof files.
-/// The API response should be a ZIP file containing multiple binary proof files.
-///
-async fn download_proofs_from_ethproofs(
-    block_hash: types::ExecutionBlockHash,
-) -> Result<ProofArchive, String> {
-    const MAX_RETRIES: u32 = 1; // Set to 1 for testing, change to 10 for production.
+async fn fetch_proofs_list(block_hash: types::ExecutionBlockHash) -> Result<Vec<Ethproof>, String> {
+    const MAX_RETRIES: u32 = 10;
     const INITIAL_DELAY_MS: u64 = 100;
     const MAX_DELAY_MS: u64 = 5000;
+    const LIMIT: u32 = 5;
 
     let client = reqwest::Client::new();
     let url = format!(
-        "https://ethproofs.org/api/v0/proofs/download/block/{}",
-        block_hash
+        "https://ethproofs.org/api/v0/proofs?block={}&limit={}",
+        block_hash, LIMIT
     );
 
     let mut delay_ms = INITIAL_DELAY_MS;
@@ -204,7 +103,7 @@ async fn download_proofs_from_ethproofs(
             block_hash = %block_hash,
             attempt,
             delay_ms,
-            "Attempting to download proofs from Ethproofs"
+            "Attempting to fetch proofs list from Ethproofs"
         );
 
         let response = client
@@ -215,41 +114,37 @@ async fn download_proofs_from_ethproofs(
 
         match response.status() {
             StatusCode::OK => {
-                debug!(
-                    block_hash = %block_hash,
-                    attempt,
-                    "Successfully downloaded proofs from Ethproofs"
-                );
-
-                // Download the ZIP file as bytes
-                let zip_bytes = response
-                    .bytes()
+                let response_data: ProofsListResponse = response
+                    .json()
                     .await
-                    .map_err(|e| format!("Failed to read response: {}", e))?;
+                    .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-                // Extract the ZIP contents
-                return extract_zip_archive(&zip_bytes);
-            }
-            StatusCode::NOT_FOUND => {
-                if attempt == MAX_RETRIES {
-                    return Err(format!(
-                        "No proofs found for block {} after {} attempts",
-                        block_hash, MAX_RETRIES
-                    ));
+                // Check if we have at least one proof
+                if !response_data.proofs.is_empty() {
+                    debug!(
+                        block_hash = %block_hash,
+                        attempt,
+                        proof_count = response_data.proofs.len(),
+                        "Successfully fetched proofs list from Ethproofs"
+                    );
+                    return Ok(response_data.proofs);
                 }
 
+                // No proofs yet, continue polling
                 debug!(
                     block_hash = %block_hash,
                     attempt,
                     next_delay_ms = delay_ms,
-                    "Proofs not ready yet, retrying..."
+                    "No proofs ready yet, retrying..."
                 );
-
-                // Wait before retrying
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-
-                // Exponential backoff: double the delay, up to MAX_DELAY_MS
-                delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+            }
+            StatusCode::NOT_FOUND => {
+                debug!(
+                    block_hash = %block_hash,
+                    attempt,
+                    next_delay_ms = delay_ms,
+                    "Block not found, retrying..."
+                );
             }
             status => {
                 return Err(format!(
@@ -258,12 +153,59 @@ async fn download_proofs_from_ethproofs(
                 ));
             }
         }
+
+        if attempt < MAX_RETRIES {
+            // Wait before retrying
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+
+            // Exponential backoff: double the delay, up to MAX_DELAY_MS
+            delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+        }
     }
 
     Err(format!(
-        "Failed to download proofs for block {} after {} attempts",
+        "No proofs found for block {} after {} attempts",
         block_hash, MAX_RETRIES
     ))
+}
+
+/// Download a proof binary directly from Ethproofs using the proof_id.
+///
+/// Returns the binary proof data.
+///
+async fn download_proof_binary(proof_id: u64) -> Result<Vec<u8>, String> {
+    let client = reqwest::Client::new();
+    let url = format!("https://ethproofs.org/api/v0/proofs/download/{}", proof_id);
+
+    debug!(proof_id, "Downloading proof binary from Ethproofs");
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let proof_data = response
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to read response: {}", e))?;
+
+            debug!(
+                proof_id,
+                size_bytes = proof_data.len(),
+                "Successfully downloaded proof binary"
+            );
+
+            Ok(proof_data.to_vec())
+        }
+        StatusCode::NOT_FOUND => Err(format!("Proof {} not found", proof_id)),
+        status => Err(format!(
+            "Request failed with status: {} for proof {}",
+            status, proof_id
+        )),
+    }
 }
 
 /// Generate a proof for an execution payload
@@ -328,46 +270,159 @@ pub async fn generate_proof<T: EthSpec>(
         "Using hardcoded execution block hash for testing proof download"
     );
 
-    // Select a prover_id to test (currently hardcoded to ZisK)
-    let selected_prover_id = select_random_prover_id();
+    use rand::Rng;
 
-    // Download proofs from Ethproofs for PoC implementation.
-    let (proof_data, prover_id) = match download_proofs_from_ethproofs(hardcoded_hash).await {
-        Ok(archive) => {
+    // Get available prover IDs as strings for matching
+    let available_prover_ids: Vec<String> = VERIFIER_STORE
+        .prover_ids()
+        .iter()
+        .map(|uuid| uuid.to_string())
+        .collect();
+
+    debug!(
+        available_prover_ids = ?available_prover_ids,
+        "Available prover IDs for matching"
+    );
+
+    // Fetch proofs list from Ethproofs (polls until we get proofs)
+    let (proof_data, prover_id_bytes) = match fetch_proofs_list(hardcoded_hash).await {
+        Ok(provers) => {
             debug!(
                 block_number,
                 subnet_id = *proof_id,
-                file_count = archive.files.len(),
-                selected_prover = ?selected_prover_id,
-                "Downloaded proof archive from Ethproofs"
+                proof_count = provers.len(),
+                "Fetched proofs list from Ethproofs"
             );
 
-            // Try to find a proof matching the selected prover_id
-            if let Some(matching_proof) = archive.find_by_prover(&selected_prover_id) {
-                let prover_uuid = Uuid::from_bytes(selected_prover_id);
-                debug!(
-                    prover_id = %prover_uuid,
-                    size_bytes = matching_proof.data.len(),
-                    "Found matching proof for selected prover in archive"
-                );
-                (matching_proof.data.clone(), matching_proof.prover_id)
-            } else {
-                let prover_uuid = Uuid::from_bytes(selected_prover_id);
+            // Filter proofs by available prover IDs
+            let matching_provers: Vec<&Ethproof> = provers
+                .iter()
+                .filter(|p| available_prover_ids.contains(&p.cluster_id))
+                .collect();
+
+            if matching_provers.is_empty() {
                 warn!(
-                    prover_id = %prover_uuid,
-                    available_proofs = archive.files.len(),
-                    "No proof found for selected prover, using fallback dummy data"
+                    block_number,
+                    available_count = provers.len(),
+                    "No proofs found for available verifiers, using fallback dummy data"
                 );
-                (dummy_data.clone(), selected_prover_id)
+                (dummy_data.clone(), select_random_prover_id())
+            } else {
+                debug!(
+                    matching_proof_count = matching_provers.len(),
+                    "Found proofs matching available verifiers"
+                );
+
+                // Try each matching proof with retry logic
+                let mut last_error = String::from("No proofs to try");
+                let mut tried_proofs = vec![];
+                let mut success_result: Option<(Vec<u8>, [u8; 16])> = None;
+
+                for _ in 0..matching_provers.len() {
+                    if success_result.is_some() {
+                        break;
+                    }
+
+                    // Randomly select from matching provers
+                    let random_index = rand::rng().random_range(0..matching_provers.len());
+                    let selected_prover = matching_provers[random_index];
+
+                    // Skip if we've already tried this one
+                    if tried_proofs.contains(&selected_prover.proof_id) {
+                        continue;
+                    }
+                    tried_proofs.push(selected_prover.proof_id);
+
+                    debug!(
+                        proof_id = selected_prover.proof_id,
+                        cluster_id = %selected_prover.cluster_id,
+                        "Attempting to download and verify proof"
+                    );
+
+                    // Download the proof binary
+                    match download_proof_binary(selected_prover.proof_id).await {
+                        Ok(proof_binary) => {
+                            // Convert cluster_id string to prover_id bytes
+                            match Uuid::parse_str(&selected_prover.cluster_id) {
+                                Ok(cluster_uuid) => {
+                                    let prover_id_bytes = *cluster_uuid.as_bytes();
+
+                                    // Create proof for verification
+                                    let test_proof = ExecutionProof::new(
+                                        block_root,
+                                        execution_block_hash,
+                                        proof_id,
+                                        1,
+                                        prover_id_bytes,
+                                        proof_binary.clone(),
+                                    );
+
+                                    // Verify the proof
+                                    if validate_proof(&test_proof) {
+                                        debug!(
+                                            proof_id = selected_prover.proof_id,
+                                            cluster_id = %selected_prover.cluster_id,
+                                            "Proof verification succeeded"
+                                        );
+                                        success_result = Some((proof_binary, prover_id_bytes));
+                                    } else {
+                                        debug!(
+                                            proof_id = selected_prover.proof_id,
+                                            cluster_id = %selected_prover.cluster_id,
+                                            "Proof verification failed, trying next proof"
+                                        );
+                                        last_error = format!(
+                                            "Proof {} verification failed",
+                                            selected_prover.proof_id
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        cluster_id = %selected_prover.cluster_id,
+                                        error = %e,
+                                        "Failed to parse cluster_id as UUID"
+                                    );
+                                    last_error = format!(
+                                        "Invalid cluster UUID: {}",
+                                        selected_prover.cluster_id
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                proof_id = selected_prover.proof_id,
+                                error = %e,
+                                "Failed to download proof, trying next"
+                            );
+                            last_error = format!(
+                                "Failed to download proof {}: {}",
+                                selected_prover.proof_id, e
+                            );
+                        }
+                    }
+                }
+
+                if let Some((binary, bytes)) = success_result {
+                    (binary, bytes)
+                } else {
+                    warn!(
+                        block_number,
+                        last_error = %last_error,
+                        "All matching proofs failed verification or download, using fallback dummy data"
+                    );
+                    (dummy_data.clone(), select_random_prover_id())
+                }
             }
         }
         Err(e) => {
             debug!(
                 error = %e,
                 block_number,
-                "Failed to download proofs from Ethproofs, using fallback dummy data"
+                "Failed to fetch proofs from Ethproofs, using fallback dummy data"
             );
-            (dummy_data.clone(), selected_prover_id)
+            (dummy_data.clone(), select_random_prover_id())
         }
     };
 
@@ -376,7 +431,7 @@ pub async fn generate_proof<T: EthSpec>(
         execution_block_hash,
         proof_id,
         1,
-        prover_id,
+        prover_id_bytes,
         proof_data,
     );
 
