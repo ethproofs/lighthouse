@@ -8,6 +8,7 @@ use crate::verifiers::VerifierStore;
 use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use types::{
     EthSpec, ExecutionPayload, ExecutionProof, Hash256,
@@ -80,29 +81,51 @@ struct ProofsListResponse {
 
 /// Fetch the list of proofs for a block from Ethproofs API.
 ///
-/// Polls the endpoint until at least one proof is available, using exponential backoff.
-/// This accepts the block hash and returns a list of available proofs.
+/// Polls the endpoint until all 3 proofs are available or a timeout is reached, using exponential backoff.
+/// This accepts the block hash and a comma-separated string of cluster IDs to query.
+/// Returns all proofs found within the timeout window.
 ///
-async fn fetch_proofs_list(block_hash: types::ExecutionBlockHash) -> Result<Vec<Ethproof>, String> {
-    const MAX_RETRIES: u32 = 60;
+async fn fetch_proofs_list(
+    block_hash: types::ExecutionBlockHash,
+    clusters: String,
+) -> Result<Vec<Ethproof>, String> {
+    const MAX_WAIT_TIME_SECS: u64 = 30;
     const INITIAL_DELAY_MS: u64 = 100;
     const MAX_DELAY_MS: u64 = 5000;
-    const LIMIT: u32 = 5;
+    const TARGET_PROOF_COUNT: usize = 3;
 
     let client = reqwest::Client::new();
     let url = format!(
-        "https://ethproofs.org/api/v0/proofs?block={}&limit={}",
-        block_hash, LIMIT
+        "https://ethproofs.org/api/v0/proofs?block={}&clusters={}",
+        block_hash, clusters
     );
 
+    let start = Instant::now();
     let mut delay_ms = INITIAL_DELAY_MS;
+    let mut accumulated_proofs: Vec<Ethproof> = Vec::new();
 
-    for attempt in 1..=MAX_RETRIES {
+    loop {
+        // Check if we've exceeded max wait time
+        if start.elapsed() > Duration::from_secs(MAX_WAIT_TIME_SECS) {
+            debug!(
+                block_hash = %block_hash,
+                accumulated_count = accumulated_proofs.len(),
+                "Max wait time reached, proceeding with accumulated proofs"
+            );
+            if accumulated_proofs.is_empty() {
+                return Err(format!(
+                    "No proofs found for block {} within {} seconds",
+                    block_hash, MAX_WAIT_TIME_SECS
+                ));
+            }
+            return Ok(accumulated_proofs);
+        }
+
         debug!(
             block_hash = %block_hash,
-            attempt,
+            accumulated_count = accumulated_proofs.len(),
             delay_ms,
-            "Attempting to fetch proofs list from Ethproofs"
+            "Polling Ethproofs for proofs"
         );
 
         let response = client
@@ -118,30 +141,32 @@ async fn fetch_proofs_list(block_hash: types::ExecutionBlockHash) -> Result<Vec<
                     .await
                     .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-                // Check if we have at least one proof
-                if !response_data.proofs.is_empty() {
-                    debug!(
-                        block_hash = %block_hash,
-                        attempt,
-                        proof_count = response_data.proofs.len(),
-                        "Successfully fetched proofs list from Ethproofs"
-                    );
-                    return Ok(response_data.proofs);
+                // Accumulate new proofs (avoid duplicates by proof_id)
+                for proof in response_data.proofs {
+                    if !accumulated_proofs
+                        .iter()
+                        .any(|p| p.proof_id == proof.proof_id)
+                    {
+                        accumulated_proofs.push(proof);
+                    }
                 }
 
-                // No proofs yet, continue polling
                 debug!(
                     block_hash = %block_hash,
-                    attempt,
-                    next_delay_ms = delay_ms,
-                    "No proofs ready yet, retrying..."
+                    accumulated_count = accumulated_proofs.len(),
+                    target_count = TARGET_PROOF_COUNT,
+                    "Accumulated proofs from Ethproofs"
                 );
+
+                // If we have all target proofs (k), return early
+                if accumulated_proofs.len() >= TARGET_PROOF_COUNT {
+                    return Ok(accumulated_proofs);
+                }
             }
             StatusCode::NOT_FOUND => {
                 debug!(
                     block_hash = %block_hash,
-                    attempt,
-                    next_delay_ms = delay_ms,
+                    accumulated_count = accumulated_proofs.len(),
                     "Block not found, retrying..."
                 );
             }
@@ -153,19 +178,12 @@ async fn fetch_proofs_list(block_hash: types::ExecutionBlockHash) -> Result<Vec<
             }
         }
 
-        if attempt < MAX_RETRIES {
-            // Wait before retrying
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+        // Wait before retrying
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
-            // Exponential backoff: double the delay, up to MAX_DELAY_MS
-            delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
-        }
+        // Exponential backoff: double the delay, up to MAX_DELAY_MS
+        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
     }
-
-    Err(format!(
-        "No proofs found for block {} after {} attempts",
-        block_hash, MAX_RETRIES
-    ))
 }
 
 /// Download a proof binary directly from Ethproofs using the proof_id.
@@ -258,80 +276,72 @@ pub async fn generate_proof<T: EthSpec>(
         "Block number ends in '00' - proceeding with proof generation"
     );
 
-    use rand::Rng;
-
-    // Get available prover IDs as strings for matching
+    // Get available prover IDs as comma-separated string for API query
     let available_prover_ids: Vec<String> = VERIFIER_STORE
         .prover_ids()
         .iter()
         .map(|uuid| uuid.to_string())
         .collect();
 
+    let clusters = available_prover_ids.join(",");
+
     debug!(
         available_prover_ids = ?available_prover_ids,
-        "Available prover IDs for matching"
+        "Available prover IDs for proof query"
     );
 
-    // Fetch proofs list from Ethproofs (polls until we get proofs)
-    let (proof_data, prover_id_bytes) = match fetch_proofs_list(execution_block_hash).await {
-        Ok(provers) => {
+    // Fetch proofs list from Ethproofs (polls until we get target proofs or timeout)
+    let (proof_data, prover_id_bytes) = match fetch_proofs_list(execution_block_hash, clusters)
+        .await
+    {
+        Ok(proofs) => {
             debug!(
                 block_number,
                 subnet_id = *proof_id,
-                proof_count = provers.len(),
+                proof_count = proofs.len(),
                 "Fetched proofs list from Ethproofs"
             );
 
-            // Filter proofs by available prover IDs
-            let matching_provers: Vec<&Ethproof> = provers
-                .iter()
-                .filter(|p| available_prover_ids.contains(&p.cluster_id))
-                .collect();
-
-            if matching_provers.is_empty() {
+            if proofs.is_empty() {
                 warn!(
                     block_number,
-                    available_count = provers.len(),
-                    "No proofs found for available verifiers, using fallback dummy data"
+                    "No proofs returned from Ethproofs, using fallback dummy data"
                 );
                 (dummy_data.clone(), select_random_prover_id())
             } else {
-                debug!(
-                    matching_proof_count = matching_provers.len(),
-                    "Found proofs matching available verifiers"
-                );
+                use rand::Rng;
 
-                // Try each matching proof with retry logic
+                // Try each proof until one verifies
                 let mut last_error = String::from("No proofs to try");
                 let mut tried_proofs = vec![];
                 let mut success_result: Option<(Vec<u8>, [u8; 16])> = None;
 
-                for _ in 0..matching_provers.len() {
+                for _ in 0..proofs.len() {
                     if success_result.is_some() {
                         break;
                     }
 
-                    // Randomly select from matching provers
-                    let random_index = rand::rng().random_range(0..matching_provers.len());
-                    let selected_prover = matching_provers[random_index];
+                    // Randomly select a proof we haven't tried yet
+                    let random_index = rand::rng().random_range(0..proofs.len());
+                    let proof_entry = &proofs[random_index];
 
                     // Skip if we've already tried this one
-                    if tried_proofs.contains(&selected_prover.proof_id) {
+                    if tried_proofs.contains(&proof_entry.proof_id) {
                         continue;
                     }
-                    tried_proofs.push(selected_prover.proof_id);
+                    tried_proofs.push(proof_entry.proof_id);
 
                     debug!(
-                        proof_id = selected_prover.proof_id,
-                        cluster_id = %selected_prover.cluster_id,
+                        proof_id = proof_entry.proof_id,
+                        cluster_id = %proof_entry.cluster_id,
                         "Attempting to download and verify proof"
                     );
 
                     // Download the proof binary
-                    match download_proof_binary(selected_prover.proof_id).await {
+                    match download_proof_binary(proof_entry.proof_id).await {
                         Ok(proof_binary) => {
                             // Convert cluster_id string to prover_id bytes
-                            match Uuid::parse_str(&selected_prover.cluster_id) {
+                            match Uuid::parse_str(&proof_entry.cluster_id) {
                                 Ok(cluster_uuid) => {
                                     let prover_id_bytes = *cluster_uuid.as_bytes();
 
@@ -348,46 +358,42 @@ pub async fn generate_proof<T: EthSpec>(
                                     // Verify the proof
                                     if validate_proof(&test_proof) {
                                         debug!(
-                                            proof_id = selected_prover.proof_id,
-                                            cluster_id = %selected_prover.cluster_id,
+                                            proof_id = proof_entry.proof_id,
+                                            cluster_id = %proof_entry.cluster_id,
                                             "Proof verification succeeded"
                                         );
                                         success_result = Some((proof_binary, prover_id_bytes));
                                     } else {
                                         debug!(
-                                            proof_id = selected_prover.proof_id,
-                                            cluster_id = %selected_prover.cluster_id,
+                                            proof_id = proof_entry.proof_id,
+                                            cluster_id = %proof_entry.cluster_id,
                                             "Proof verification failed, trying next proof"
                                         );
                                         last_error = format!(
                                             "Proof {} verification failed",
-                                            selected_prover.proof_id
+                                            proof_entry.proof_id
                                         );
                                     }
                                 }
                                 Err(e) => {
                                     warn!(
-                                        cluster_id = %selected_prover.cluster_id,
+                                        cluster_id = %proof_entry.cluster_id,
                                         error = %e,
                                         "Failed to parse cluster_id as UUID"
                                     );
-                                    last_error = format!(
-                                        "Invalid cluster UUID: {}",
-                                        selected_prover.cluster_id
-                                    );
+                                    last_error =
+                                        format!("Invalid cluster UUID: {}", proof_entry.cluster_id);
                                 }
                             }
                         }
                         Err(e) => {
                             debug!(
-                                proof_id = selected_prover.proof_id,
+                                proof_id = proof_entry.proof_id,
                                 error = %e,
                                 "Failed to download proof, trying next"
                             );
-                            last_error = format!(
-                                "Failed to download proof {}: {}",
-                                selected_prover.proof_id, e
-                            );
+                            last_error =
+                                format!("Failed to download proof {}: {}", proof_entry.proof_id, e);
                         }
                     }
                 }
@@ -398,7 +404,7 @@ pub async fn generate_proof<T: EthSpec>(
                     warn!(
                         block_number,
                         last_error = %last_error,
-                        "All matching proofs failed verification or download, using fallback dummy data"
+                        "All proofs failed verification or download, using fallback dummy data"
                     );
                     (dummy_data.clone(), select_random_prover_id())
                 }

@@ -90,7 +90,7 @@ impl VerifierStore {
         // Register verifiers for known prover UUIDs
         // Current verification_keys directory mapping:
         // - brevis: 4eb78a0b-61c1-464f-80f2-20f1f56aea73 -> Pico verifier
-        // - zisk:   787d9474-1181-43fd-936e-9b15976a0308 -> ZisK verifier
+        // - zisk:   33f14a82-47b7-42d7-9bc1-b81a46eea4fe -> ZisK verifier
         // - zkm:    84a01f4b-8078-44cf-b463-90ddcd124960 -> ZKM verifier
 
         // Register Pico verifier for brevis
@@ -104,7 +104,7 @@ impl VerifierStore {
 
         // Register ZisK verifier
         let zisk_uuid =
-            Uuid::parse_str("787d9474-1181-43fd-936e-9b15976a0308").expect("Valid UUID");
+            Uuid::parse_str("33f14a82-47b7-42d7-9bc1-b81a46eea4fe").expect("Valid UUID");
         store.register(
             zisk_uuid,
             zisk::ZiskVerifier::name(),
@@ -112,8 +112,7 @@ impl VerifierStore {
         );
 
         // Register ZKM verifier
-        let zkm_uuid =
-            Uuid::parse_str("84a01f4b-8078-44cf-b463-90ddcd124960").expect("Valid UUID");
+        let zkm_uuid = Uuid::parse_str("84a01f4b-8078-44cf-b463-90ddcd124960").expect("Valid UUID");
         store.register(zkm_uuid, zkm::ZkmVerifier::name(), zkm::ZkmVerifier::verify);
 
         store
